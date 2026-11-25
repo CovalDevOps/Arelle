@@ -1,0 +1,224 @@
+## Builds the Arelle validation image for Vercel Sandbox, with Arelle's web cache pre-filled for every regime
+## in service/cache_entrypoints.json, verifies it offline, and pushes it to Vercel Container Registry.
+##
+## The taxonomy cache is warmed once per version of the entry-point list, pin list and warm-up code, and kept in
+## the Actions cache, so rebuilding for a code change reuses it instead of re-downloading. Every warm-up is
+## checked against service/taxonomy-cache.lock.json (SHA-256 of every file): if a publisher has changed,
+## added or removed a file, the build fails and prints how to review and accept the change. So an evicted
+## Actions cache (7 days unused) costs a re-download, never a silent change of taxonomy content.
+##
+## Builds and pushes when service/VERSION changes on qa (e.g. merging a PR that bumps it): tags
+## :<service/VERSION>  (never moved)  and  :qa  (moved to every new build). master does not build: the
+## image tested from qa is promoted to :prod as-is, never rebuilt.
+## Promotion to :prod is a separate workflow (sandbox-image-promote.yml).
+##
+## Pull requests that touch service/ build and verify only; nothing is pushed.
+##
+## Repository variables:
+##   VERCEL_TEAM_ID       team ID (team_...), used to log in to VCR via OIDC
+##   VERCEL_TEAM_SLUG     team slug as in the dashboard URL
+##   VERCEL_PROJECT_SLUG  Vercel project that owns the image repository (same project as the Layer 1 caller,
+##                        or share the repository with it)
+## The team needs a VCR OIDC policy with read and write access for this GitHub repository.
+
+name: Sandbox image
+
+on:
+  push:
+    branches: [qa]
+    paths:
+      - service/VERSION
+  pull_request:
+    paths:
+      - service/**
+      - requirements.txt
+      - .github/workflows/sandbox-image.yml
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: sandbox-image-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  REPOSITORY: arelle-sandbox
+  PYTHON_VERSION: '3.14.7'
+
+jobs:
+  build:
+    name: Build, verify and push
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      id-token: write  # VCR login via OIDC
+    env:
+      # Inside the workspace but outside the main build context (service/Dockerfile.dockerignore is an allowlist).
+      TAXONOMY_DIR: ${{ github.workspace }}/.taxonomy-cache
+    steps:
+      - name: Checkout Arelle
+        uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 1
+
+      - name: Read version
+        id: meta
+        run: |
+          version="$(tr -d '[:space:]' < service/VERSION)"
+          if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "service/VERSION must be semver (x.y.z), got '$version'" >&2
+            exit 1
+          fi
+          image="vcr.vercel.com/${{ vars.VERCEL_TEAM_SLUG }}/${{ vars.VERCEL_PROJECT_SLUG }}/${REPOSITORY}"
+          {
+            echo "version=$version"
+            echo "image=$image"
+            echo "push=${{ github.event_name != 'pull_request' }}"
+          } >> "$GITHUB_OUTPUT"
+
+      ## ---------- taxonomy cache ----------
+
+      - name: Restore taxonomy cache
+        id: taxonomy-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.TAXONOMY_DIR }}
+          key: arelle-taxonomy-${{ hashFiles('service/cache_entrypoints.json', 'service/taxonomy-cache.lock.json', 'service/warm_cache.py', 'service/arelle_cache.py', 'service/certs/**') }}
+
+      - name: Set up Python
+        if: steps.taxonomy-cache.outputs.cache-hit != 'true'
+        uses: actions/setup-python@v7.1.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Warm taxonomy cache and check it against the pin list
+        if: steps.taxonomy-cache.outputs.cache-hit != 'true'
+        run: |
+          python -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/pip" install --quiet -c requirements.txt -r service/requirements.txt
+          "$RUNNER_TEMP/venv/bin/python" service/warm_cache.py \
+            --dest "$TAXONOMY_DIR/cache" --report "$TAXONOMY_DIR/cache-manifest.json" --jobs 6 \
+            --lock service/taxonomy-cache.lock.json
+
+      - name: Upload warm-up report on pin list mismatch
+        if: failure() && steps.taxonomy-cache.outputs.cache-hit != 'true'
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: taxonomy-cache-mismatch-${{ github.run_number }}
+          path: ${{ env.TAXONOMY_DIR }}/cache-manifest.json
+          if-no-files-found: ignore
+
+      ## Only reached when the warm-up matched the pin list, so a mismatching cache is never saved.
+      - name: Save taxonomy cache
+        if: steps.taxonomy-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.TAXONOMY_DIR }}
+          key: ${{ steps.taxonomy-cache.outputs.cache-primary-key }}
+
+      - name: Check taxonomy cache against the pin list
+        if: steps.taxonomy-cache.outputs.cache-hit == 'true'
+        run: |
+          python3 service/warm_cache.py --check-report "$TAXONOMY_DIR/cache-manifest.json" \
+            --lock service/taxonomy-cache.lock.json
+
+      - name: Record taxonomy cache manifest
+        id: taxonomy
+        run: echo "manifest_sha256=$(sha256sum "$TAXONOMY_DIR/cache-manifest.json" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+
+      - name: Upload taxonomy cache manifest
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: taxonomy-cache-manifest-${{ steps.meta.outputs.version }}-${{ github.run_number }}
+          path: ${{ env.TAXONOMY_DIR }}/cache-manifest.json
+
+      ## ---------- image ----------
+
+      - name: Log in to Vercel Container Registry
+        if: steps.meta.outputs.push == 'true'
+        uses: vercel/vcr-action/login@v1
+        with:
+          team: ${{ vars.VERCEL_TEAM_ID }}
+
+      - name: Refuse to overwrite an existing version
+        if: steps.meta.outputs.push == 'true'
+        run: |
+          if docker manifest inspect "${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.version }}" > /dev/null 2>&1; then
+            echo "Tag ${{ steps.meta.outputs.version }} already exists. Bump service/VERSION." >&2
+            exit 1
+          fi
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4.4.1
+
+      - name: Build image
+        uses: docker/build-push-action@v7.4.0
+        with:
+          context: .
+          file: service/Dockerfile
+          build-contexts: taxonomy=${{ env.TAXONOMY_DIR }}
+          platforms: linux/amd64
+          build-args: |
+            PYTHON_VERSION=${{ env.PYTHON_VERSION }}
+            SERVICE_VERSION=${{ steps.meta.outputs.version }}
+            GIT_SHA=${{ github.sha }}
+            TAXONOMY_CACHE_SHA256=${{ steps.taxonomy.outputs.manifest_sha256 }}
+          load: true
+          tags: ${{ env.REPOSITORY }}:verify
+          cache-from: type=gha,scope=sandbox-image
+          cache-to: type=gha,scope=sandbox-image,mode=max
+
+      - name: Verify image offline
+        run: |
+          docker run --rm --network none --platform linux/amd64 "${REPOSITORY}:verify" \
+            /opt/venv/bin/python /app/service/verify_image.py
+
+      - name: Check layer sizes (VCR limit is 2 GB per compressed layer)
+        run: |
+          docker history --no-trunc --format '{{.Size}}\t{{.CreatedBy}}' "${REPOSITORY}:verify" | head -20
+          # Uncompressed size is an upper bound for the compressed layer VCR checks.
+          largest=$(docker history --human=false --format '{{.Size}}' "${REPOSITORY}:verify" | sort -n | tail -1)
+          echo "largest layer: $((largest / 1024 / 1024)) MB"
+          if [ "$largest" -gt $((1900 * 1024 * 1024)) ]; then
+            echo "A layer is over 1.9 GB uncompressed. Check its compressed size, or split the taxonomy cache COPY by host." >&2
+            exit 1
+          fi
+
+      - name: Push image
+        id: push
+        if: steps.meta.outputs.push == 'true'
+        uses: docker/build-push-action@v7.4.0
+        with:
+          context: .
+          file: service/Dockerfile
+          build-contexts: taxonomy=${{ env.TAXONOMY_DIR }}
+          platforms: linux/amd64
+          build-args: |
+            PYTHON_VERSION=${{ env.PYTHON_VERSION }}
+            SERVICE_VERSION=${{ steps.meta.outputs.version }}
+            GIT_SHA=${{ github.sha }}
+            TAXONOMY_CACHE_SHA256=${{ steps.taxonomy.outputs.manifest_sha256 }}
+          push: true
+          tags: |
+            ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.version }}
+            ${{ steps.meta.outputs.image }}:qa
+          cache-from: type=gha,scope=sandbox-image
+          # Plain single-platform manifest: attestation manifests aren't needed by Sandbox.
+          provenance: false
+          sbom: false
+
+      - name: Summary
+        if: steps.meta.outputs.push == 'true'
+        run: |
+          {
+            echo "### Sandbox image pushed"
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Image | \`${{ steps.meta.outputs.image }}\` |"
+            echo "| Tags | \`${{ steps.meta.outputs.version }}\`, \`qa\` |"
+            echo "| Digest | \`${{ steps.push.outputs.digest }}\` |"
+            echo "| Taxonomy cache manifest | \`${{ steps.taxonomy.outputs.manifest_sha256 }}\` (warmed this run: ${{ steps.taxonomy-cache.outputs.cache-hit != 'true' }}) |"
+            echo ""
+            echo "VCR must finish preparing the image (status **Ready** on the repository page) before Sandbox can start it."
+          } >> "$GITHUB_STEP_SUMMARY"

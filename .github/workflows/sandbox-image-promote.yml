@@ -1,0 +1,80 @@
+## Promotes a tested sandbox image to production by moving the :prod tag to the digest that
+## the source tag (default :qa) points to. Nothing is rebuilt.
+##
+## Rollback: run again with source_tag set to an earlier version, e.g. 0.1.0.
+##
+## Uses the GitHub environment "sandbox-production"; add required reviewers to it so promotion needs approval.
+## Same repository variables and VCR OIDC policy as sandbox-image.yml.
+
+name: Sandbox image promote
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_tag:
+        description: 'Tag to promote to prod (qa, or a version such as 0.1.0 for rollback)'
+        default: 'qa'
+        required: true
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: sandbox-image-promote
+  cancel-in-progress: false
+
+env:
+  REPOSITORY: arelle-sandbox
+
+jobs:
+  promote:
+    name: Move prod tag
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment: sandbox-production
+    permissions:
+      id-token: write  # VCR login via OIDC
+    steps:
+      - name: Log in to Vercel Container Registry
+        uses: vercel/vcr-action/login@v1
+        with:
+          team: ${{ vars.VERCEL_TEAM_ID }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4.4.1
+
+      - name: Retag
+        env:
+          SOURCE_TAG: ${{ inputs.source_tag }}
+        run: |
+          if ! [[ "$SOURCE_TAG" =~ ^(qa|[0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+            echo "source_tag must be 'qa' or a version x.y.z" >&2
+            exit 1
+          fi
+          image="vcr.vercel.com/${{ vars.VERCEL_TEAM_SLUG }}/${{ vars.VERCEL_PROJECT_SLUG }}/${REPOSITORY}"
+          digest_of() { docker buildx imagetools inspect "$1" --format '{{json .Manifest}}' | jq -r .digest; }
+
+          source_digest="$(digest_of "$image:$SOURCE_TAG")"
+          previous_digest="$(digest_of "$image:prod" 2>/dev/null || echo none)"
+          echo "source  $SOURCE_TAG -> $source_digest"
+          echo "prod was            $previous_digest"
+
+          if [ "$source_digest" = "$previous_digest" ]; then
+            echo "prod already points to $source_digest"
+          else
+            docker buildx imagetools create --tag "$image:prod" "$image@$source_digest"
+          fi
+
+          new_digest="$(digest_of "$image:prod")"
+          if [ "$new_digest" != "$source_digest" ]; then
+            echo "prod points to $new_digest, expected $source_digest" >&2
+            exit 1
+          fi
+          {
+            echo "### Promoted to prod"
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Source tag | \`$SOURCE_TAG\` |"
+            echo "| prod now | \`$new_digest\` |"
+            echo "| prod before | \`$previous_digest\` |"
+          } >> "$GITHUB_STEP_SUMMARY"

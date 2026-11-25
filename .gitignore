@@ -1,3 +1,4 @@
+.env
 *.iml
 *.pyc
 .DS_Store
@@ -82,3 +83,12 @@ tests/resources/packages/
 .settings
 /.classpath
 /.pydevproject
+
+# Claude Code ctags index
+.claude/tags
+
+# Claude Code local setup (personal, not committed)
+.claude/settings.local.json
+CLAUDE.local.md
+.tmp/
+/.env

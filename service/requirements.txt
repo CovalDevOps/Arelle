@@ -1,0 +1,25 @@
+# Python packages for the sandbox image. No versions here on purpose: the build installs with
+# `-c requirements.txt`, so versions come from upstream's pins and stay in step with Arelle releases.
+# Left out compared with requirements.txt: database drivers (xbrlDB plugin), rdflib, graphviz, pywin32.
+
+# core modules
+bottle
+certifi
+cheroot
+filelock
+isodate
+jaconv
+jsonschema
+lxml
+numpy
+openpyxl
+pyparsing
+python-dateutil
+regex
+tornado
+truststore
+typing-extensions
+
+# ESEF / NL validation: image checks (arelle/utils/validate/ESEFImage.py) and inline CSS checks
+pillow
+tinycss2
