@@ -7,7 +7,9 @@
 ## added or removed a file, the build fails and prints how to review and accept the change. So an evicted
 ## Actions cache (7 days unused) costs a re-download, never a silent change of taxonomy content.
 ##
-## Pushes tags  :<service/VERSION>  (never moved)  and  :qa  (moved to every new build).
+## Builds and pushes when service/VERSION changes on qa (e.g. merging a PR that bumps it): tags
+## :<service/VERSION>  (never moved)  and  :qa  (moved to every new build). master does not build: the
+## image tested from qa is promoted to :prod as-is, never rebuilt.
 ## Promotion to :prod is a separate workflow (sandbox-image-promote.yml).
 ##
 ## Pull requests that touch service/ build and verify only; nothing is pushed.
@@ -23,7 +25,7 @@ name: Sandbox image
 
 on:
   push:
-    branches: [master]
+    branches: [qa]
     paths:
       - service/VERSION
   pull_request:
