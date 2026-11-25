@@ -57,3 +57,6 @@ tests/resources/packages/
 .settings
 /.classpath
 /.pydevproject
+.tmp
+.claude
+CLAUDE.local.md

@@ -1,0 +1,16 @@
+# Build context allowlist for service/Dockerfile (BuildKit uses this file instead of the root .dockerignore).
+# The taxonomy cache is not in this context: it comes in through the named build context "taxonomy".
+*
+!arelle/
+!arelleCmdLine.py
+!requirements.txt
+!service/
+
+**/__pycache__
+**/*.pyc
+arelle/plugin/EDGAR
+arelle/plugin/xule
+service/Dockerfile*
+service/build_image.sh
+# Build-time only (warm-up TLS); not needed in the offline image.
+service/certs
